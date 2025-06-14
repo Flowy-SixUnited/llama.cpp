@@ -951,7 +951,7 @@ struct server_task_result_cmpl_partial : server_task_result {
     }
 
     json to_json_oaicompat_chat() {
-        bool first = n_decoded == 1;
+        bool first = n_decoded == 0;
         std::time_t t = std::time(0);
         json choices;
 
@@ -962,18 +962,15 @@ struct server_task_result_cmpl_partial : server_task_result {
                                             {"delta", json{{"role", "assistant"}}}}});
             } else {
                 // We have to send this as two updates to conform to openai behavior
-                // initial_ret is the role message for stream=True
                 json initial_ret = json{{"choices", json::array({json{
                                         {"finish_reason", nullptr},
                                         {"index", 0},
                                         {"delta", json{
-                                            {"role", "assistant"},
-                                            {"content", ""}
+                                            {"role", "assistant"}
                                         }}}})},
                             {"created", t},
                             {"id", oaicompat_cmpl_id},
                             {"model", oaicompat_model},
-                            {"system_fingerprint", build_info},
                             {"object", "chat.completion.chunk"}};
 
                 json second_ret = json{
@@ -985,18 +982,7 @@ struct server_task_result_cmpl_partial : server_task_result {
                             {"created", t},
                             {"id", oaicompat_cmpl_id},
                             {"model", oaicompat_model},
-                            {"system_fingerprint", build_info},
                             {"object", "chat.completion.chunk"}};
-
-                if (prob_output.probs.size() > 0) {
-                    second_ret["choices"][0]["logprobs"] = json{
-                        {"content", completion_token_output::probs_vector_to_json({prob_output}, post_sampling_probs)},
-                    };
-                }
-
-                if (timings.prompt_n >= 0) {
-                    second_ret.push_back({"timings", timings.to_json()});
-                }
 
                 return std::vector<json>({initial_ret, second_ret});
             }
@@ -1151,6 +1137,9 @@ struct server_task_result_metrics : server_task_result {
     int n_tasks_deferred;
     int64_t t_start;
 
+    int32_t kv_cache_tokens_count;
+    int32_t kv_cache_used_cells;
+
     // TODO: somehow reuse server_metrics in the future, instead of duplicating the fields
     uint64_t n_prompt_tokens_processed_total = 0;
     uint64_t t_prompt_processing_total       = 0;
@@ -1189,6 +1178,9 @@ struct server_task_result_metrics : server_task_result {
 
             { "n_decode_total",                  n_decode_total },
             { "n_busy_slots_total",              n_busy_slots_total },
+
+            { "kv_cache_tokens_count",           kv_cache_tokens_count },
+            { "kv_cache_used_cells",             kv_cache_used_cells },
 
             { "slots",                           slots_data },
         };
@@ -1891,7 +1883,6 @@ struct server_context {
     float slot_prompt_similarity = 0.0f;
 
     common_chat_templates_ptr chat_templates;
-    oaicompat_parser_options  oai_parser_opt;
 
     ~server_context() {
         mtmd_free(mctx);
@@ -2013,23 +2004,6 @@ struct server_context {
             }
         }
 
-        if (!llama_kv_self_can_shift(ctx)) {
-            if (params_base.ctx_shift) {
-                params_base.ctx_shift = false;
-                SRV_WRN("%s\n", "ctx_shift is not supported by this context, it will be disabled");
-            }
-
-            if (params_base.n_cache_reuse) {
-                params_base.n_cache_reuse = 0;
-                SRV_WRN("%s\n", "cache_reuse is not supported by this context, it will be disabled");
-            }
-
-            if (!params_base.speculative.model.path.empty()) {
-                SRV_ERR("%s\n", "err: speculative decode is not supported by this context");
-                return false;
-            }
-        }
-
         return true;
     }
 
@@ -2087,15 +2061,6 @@ struct server_context {
         }
 
         metrics.init();
-
-        oai_parser_opt = {
-            /* use_jinja             */ params_base.use_jinja,
-            /* prefill_assistant     */ params_base.prefill_assistant,
-            /* reasoning_format      */ params_base.reasoning_format,
-            /* common_chat_templates */ chat_templates.get(),
-            /* allow_image           */ mctx ? mtmd_support_vision(mctx) : false,
-            /* allow_audio           */ mctx ? mtmd_support_audio (mctx) : false,
-        };
     }
 
     server_slot * get_slot_by_id(int id) {
@@ -2284,14 +2249,6 @@ struct server_context {
 
         if (incomplete) {
             slot.has_next_token = true;
-        }
-
-        // if context shifting is disabled, make sure that we don't run out of context
-        if (!params_base.ctx_shift && slot.n_past + 1 >= slot.n_ctx) {
-            slot.stop           = STOP_TYPE_LIMIT;
-            slot.has_next_token = false;
-
-            SLT_DBG(slot, "stopped due to running out of context, n_past = %d, n_ctx = %d\n", slot.n_past, slot.n_ctx);
         }
 
         // check the limits
@@ -2789,6 +2746,9 @@ struct server_context {
                     res->n_tasks_deferred    = queue_tasks.queue_tasks_deferred.size();
                     res->t_start             = metrics.t_start;
 
+                    res->kv_cache_tokens_count = llama_kv_self_n_tokens(ctx);
+                    res->kv_cache_used_cells   = llama_kv_self_used_cells(ctx);
+
                     res->n_prompt_tokens_processed_total = metrics.n_prompt_tokens_processed_total;
                     res->t_prompt_processing_total       = metrics.t_prompt_processing_total;
                     res->n_tokens_predicted_total        = metrics.n_tokens_predicted_total;
@@ -3213,15 +3173,7 @@ struct server_context {
                                 // if we don't cache the prompt, we have to remove the entire KV cache
                                 llama_kv_self_seq_rm(ctx, slot.id, 0, -1);
                                 slot.n_past = 0;
-                                slot.cache_tokens.clear(); // TODO: not needed, will be cleared later via "keep_first()"
-                            }
-
-                            if (slot.n_past > 0 && slot.n_past < (int) slot.cache_tokens.size()) {
-                                if (llama_kv_self_seq_pos_min(ctx, slot.id) > 0) {
-                                    SLT_WRN(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA, see %s)\n",
-                                            "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
-                                    slot.n_past = 0;
-                                }
+                                slot.cache_tokens.clear();
                             }
                         }
 
@@ -3351,37 +3303,6 @@ struct server_context {
             common_set_adapter_lora(ctx, slot_batched->lora);
         }
 
-        const bool do_encode = (params_base.embedding || params_base.reranking);
-
-        // pad the batch so that batch.n_tokens >= n_slots
-        // TODO: temporary workaround for https://github.com/ggml-org/llama.cpp/issues/13689
-        if (do_encode) {
-            const int n_slots = slots.size();
-
-            if (batch.n_tokens < n_slots) {
-                std::set<llama_seq_id> seq_ids;
-                for (int j = 0; j < batch.n_tokens; ++j) {
-                    seq_ids.insert(batch.seq_id[j][0]);
-                }
-
-                // find unused sequence id
-                llama_seq_id seq_id = -1;
-                for (int i = 0; i < n_slots; ++i) {
-                    if (seq_ids.find(i) == seq_ids.end()) {
-                        seq_id = i;
-                    }
-                }
-
-                const int n_add = n_slots - batch.n_tokens;
-
-                SRV_WRN("adding %d dummy tokens to the batch, seq_id = %d\n", n_add, seq_id);
-
-                for (int j = 0; j < n_add; ++j) {
-                    common_batch_add(batch, 0, j, { seq_id }, false);
-                }
-            }
-        }
-
         // process the created batch of tokens
         for (int32_t i = 0; i < batch.n_tokens; i += n_batch) {
             const int32_t n_tokens = std::min(n_batch, batch.n_tokens - i);
@@ -3398,7 +3319,7 @@ struct server_context {
 
             int ret = 0;
 
-            if (do_encode) {
+            if (params_base.embedding || params_base.reranking) {
                 ret = llama_encode(ctx, batch_view);
             } else {
                 ret = llama_decode(ctx, batch_view);
@@ -3407,29 +3328,14 @@ struct server_context {
             metrics.on_decoded(slots);
 
             if (ret != 0) {
-                {
-                    std::string err;
-
-                    if (n_batch == 1 && ret == 1) {
-                        err = "Context size has been exceeded.";
+                if (n_batch == 1 || ret < 0) {
+                    // if you get here, it means the KV cache is full - try increasing it via the context size
+                    SRV_ERR("failed to decode the batch: KV cache is full - try increasing it via the context size, i = %d, n_batch = %d, ret = %d\n", i, n_batch, ret);
+                    for (auto & slot : slots) {
+                        slot.release();
+                        send_error(slot, "Input prompt is too big compared to KV size. Please try increasing KV size.");
                     }
-
-                    if (ret == -1) {
-                        err = "Invalid input batch.";
-                    }
-
-                    if (ret < -1) {
-                        err = "Compute error.";
-                    }
-
-                    if (!err.empty()) {
-                        SRV_ERR("%s, i = %d, n_batch = %d, ret = %d\n", err.c_str(), i, n_batch, ret);
-                        for (auto & slot : slots) {
-                            slot.release();
-                            send_error(slot, err);
-                        }
-                        break;
-                    }
+                    break; // break loop of n_batch
                 }
 
                 // retry with half the batch size to try to find a free slot in the KV cache
@@ -3763,7 +3669,6 @@ int main(int argc, char ** argv) {
             "/health",
             "/models",
             "/v1/models",
-            "/api/tags"
         };
 
         // If API key is not set, skip validation
@@ -3802,7 +3707,7 @@ int main(int argc, char ** argv) {
             if (req.path == "/" || tmp.back() == "html") {
                 res.set_content(reinterpret_cast<const char*>(loading_html), loading_html_len, "text/html; charset=utf-8");
                 res.status = 503;
-            } else if (req.path == "/models" || req.path == "/v1/models" || req.path == "/api/tags") {
+            } else if (req.path == "/models" || req.path == "/v1/models") {
                 // allow the models endpoint to be accessed during loading
                 return true;
             } else {
@@ -3945,6 +3850,14 @@ int main(int argc, char ** argv) {
                     {"name",  "predicted_tokens_seconds"},
                     {"help",  "Average generation throughput in tokens/s."},
                     {"value",  res_metrics->n_tokens_predicted ? 1.e3 / res_metrics->t_tokens_generation * res_metrics->n_tokens_predicted : 0.}
+            },{
+                    {"name",  "kv_cache_usage_ratio"},
+                    {"help",  "KV-cache usage. 1 means 100 percent usage."},
+                    {"value",  1. * res_metrics->kv_cache_used_cells / params.n_ctx}
+            },{
+                    {"name",  "kv_cache_tokens"},
+                    {"help",  "KV-cache tokens."},
+                    {"value",  (uint64_t) res_metrics->kv_cache_tokens_count}
             },{
                     {"name",  "requests_processing"},
                     {"help",  "Number of requests processing."},
@@ -4102,10 +4015,7 @@ int main(int argc, char ** argv) {
             { "default_generation_settings", ctx_server.default_generation_settings_for_props },
             { "total_slots",                 ctx_server.params_base.n_parallel },
             { "model_path",                  ctx_server.params_base.model.path },
-            { "modalities",                  json{
-                {"vision", ctx_server.oai_parser_opt.allow_image},
-                {"audio",  ctx_server.oai_parser_opt.allow_audio},
-            } },
+            { "modalities",                  json{{"vision", ctx_server.mctx != nullptr}} }, // TODO: add more in the future
             { "chat_template",               common_chat_templates_source(ctx_server.chat_templates.get()) },
             { "bos_token",                   common_token_to_piece(ctx_server.ctx, llama_vocab_bos(ctx_server.vocab), /* special= */ true)},
             { "eos_token",                   common_token_to_piece(ctx_server.ctx, llama_vocab_eos(ctx_server.vocab), /* special= */ true)},
@@ -4143,19 +4053,6 @@ int main(int argc, char ** argv) {
                     { "llama.context_length", ctx_server.slots.back().n_ctx, },
                 }
             },
-            {"modelfile", ""},
-            {"parameters", ""},
-            {"template", common_chat_templates_source(ctx_server.chat_templates.get())},
-            {"details", {
-                {"parent_model", ""},
-                {"format", "gguf"},
-                {"family", ""},
-                {"families", {""}},
-                {"parameter_size", ""},
-                {"quantization_level", ""}
-            }},
-            {"model_info", ""},
-            {"capabilities", {"completion"}}
         };
 
         res_ok(res, data);
@@ -4196,10 +4093,10 @@ int main(int argc, char ** argv) {
                 for (auto & file : files) {
                     mtmd::bitmap bmp(mtmd_helper_bitmap_init_from_buf(file.data(), file.size()));
                     if (!bmp.ptr) {
-                        throw std::runtime_error("Failed to load image or audio file");
+                        throw std::runtime_error("Failed to load image");
                     }
                     // calculate bitmap hash (for KV caching)
-                    std::string hash = fnv_hash(bmp.data(), bmp.n_bytes());
+                    std::string hash = fnv_hash(bmp.data(), bmp.nx()*bmp.ny()*3);
                     bmp.set_id(hash.c_str());
                     bitmaps.entries.push_back(std::move(bmp));
                 }
@@ -4431,7 +4328,7 @@ int main(int argc, char ** argv) {
             OAICOMPAT_TYPE_NONE); // infill is not OAI compatible
     };
 
-    const auto handle_chat_completions = [&ctx_server, &res_error, &handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
+    const auto handle_chat_completions = [&ctx_server, &params, &res_error, &handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
         LOG_DBG("request: %s\n", req.body.c_str());
         if (ctx_server.params_base.embedding) {
             res_error(res, format_error_response("This server does not support completions. Start it without `--embeddings`", ERROR_TYPE_NOT_SUPPORTED));
@@ -4440,9 +4337,12 @@ int main(int argc, char ** argv) {
 
         auto body = json::parse(req.body);
         std::vector<raw_buffer> files;
-        json data = oaicompat_chat_params_parse(
+        json data = oaicompat_completion_params_parse(
             body,
-            ctx_server.oai_parser_opt,
+            params.use_jinja,
+            params.reasoning_format,
+            ctx_server.chat_templates.get(),
+            ctx_server.mctx,
             files);
 
         handle_completions_impl(
@@ -4455,12 +4355,15 @@ int main(int argc, char ** argv) {
     };
 
     // same with handle_chat_completions, but without inference part
-    const auto handle_apply_template = [&ctx_server, &res_ok](const httplib::Request & req, httplib::Response & res) {
+    const auto handle_apply_template = [&ctx_server, &params, &res_ok](const httplib::Request & req, httplib::Response & res) {
         auto body = json::parse(req.body);
         std::vector<raw_buffer> files; // dummy, unused
-        json data = oaicompat_chat_params_parse(
+        json data = oaicompat_completion_params_parse(
             body,
-            ctx_server.oai_parser_opt,
+            params.use_jinja,
+            params.reasoning_format,
+            ctx_server.chat_templates.get(),
+            ctx_server.mctx,
             files);
         res_ok(res, {{ "prompt", std::move(data.at("prompt")) }});
     };
@@ -4473,28 +4376,6 @@ int main(int argc, char ** argv) {
         }
 
         json models = {
-            {"models", {
-                {
-                    {"name", params.model_alias.empty() ? params.model.path : params.model_alias},
-                    {"model", params.model_alias.empty() ? params.model.path : params.model_alias},
-                    {"modified_at", ""},
-                    {"size", ""},
-                    {"digest", ""}, // dummy value, llama.cpp does not support managing model file's hash
-                    {"type", "model"},
-                    {"description", ""},
-                    {"tags", {""}},
-                    {"capabilities", {"completion"}},
-                    {"parameters", ""},
-                    {"details", {
-                        {"parent_model", ""},
-                        {"format", "gguf"},
-                        {"family", ""},
-                        {"families", {""}},
-                        {"parameter_size", ""},
-                        {"quantization_level", ""}
-                    }}
-                }
-            }},
             {"object", "list"},
             {"data", {
                 {
@@ -4504,7 +4385,7 @@ int main(int argc, char ** argv) {
                     {"owned_by", "llamacpp"},
                     {"meta",     model_meta},
                 },
-            }}
+             }}
         };
 
         res_ok(res, models);
@@ -4832,13 +4713,11 @@ int main(int argc, char ** argv) {
     svr->Post("/api/show",            handle_api_show);
     svr->Get ("/models",              handle_models); // public endpoint (no API key check)
     svr->Get ("/v1/models",           handle_models); // public endpoint (no API key check)
-    svr->Get ("/api/tags",            handle_models); // ollama specific endpoint. public endpoint (no API key check)
     svr->Post("/completion",          handle_completions); // legacy
     svr->Post("/completions",         handle_completions);
     svr->Post("/v1/completions",      handle_completions_oai);
     svr->Post("/chat/completions",    handle_chat_completions);
     svr->Post("/v1/chat/completions", handle_chat_completions);
-    svr->Post("/api/chat",            handle_chat_completions); // ollama specific endpoint
     svr->Post("/infill",              handle_infill);
     svr->Post("/embedding",           handle_embeddings); // legacy
     svr->Post("/embeddings",          handle_embeddings);
